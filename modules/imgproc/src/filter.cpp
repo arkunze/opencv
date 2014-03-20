@@ -3209,7 +3209,7 @@ static bool ocl_filter2D( InputArray _src, OutputArray _dst, int ddepth,
 
     cv::Size sz = _src.size();
     size_t globalsize[2] = {sz.width, sz.height};
-    size_t localsize[2] = {0, 1};
+    size_t *localsize = NULL;
 
     ocl::Kernel kernel;
     UMat src; Size wholeSize;
@@ -3220,59 +3220,134 @@ static bool ocl_filter2D( InputArray _src, OutputArray _dst, int ddepth,
         src.locateROI(wholeSize, ofs);
     }
 
-    size_t maxWorkItemSizes[32]; device.maxWorkItemSizes(maxWorkItemSizes);
-    size_t tryWorkItems = maxWorkItemSizes[0];
-    for (;;)
+    // For smaller filter kernels, there is a special kernel that is more
+    // efficient than the general one.
+    UMat kernalDataUMat;
+    if (device.isIntel() && (device.type() & ocl::Device::TYPE_GPU) &&
+        ((ksize.width < 5 && ksize.height < 5) ||
+        (ksize.width == 5 && ksize.height == 5 && cn == 1)))
     {
-        size_t BLOCK_SIZE = tryWorkItems;
-        while (BLOCK_SIZE > 32 && BLOCK_SIZE >= (size_t)ksize.width * 2 && BLOCK_SIZE > (size_t)sz.width * 2)
-            BLOCK_SIZE /= 2;
-#if 1 // TODO Mode with several blocks requires a much more VGPRs, so this optimization is not actual for the current devices
-        size_t BLOCK_SIZE_Y = 1;
-#else
-        size_t BLOCK_SIZE_Y = 8; // TODO Check heuristic value on devices
-        while (BLOCK_SIZE_Y < BLOCK_SIZE / 8 && BLOCK_SIZE_Y * src.clCxt->getDeviceInfo().maxComputeUnits * 32 < (size_t)src.rows)
-            BLOCK_SIZE_Y *= 2;
-#endif
-
-        if ((size_t)ksize.width > BLOCK_SIZE)
-            return false;
-
-        int requiredTop = anchor.y;
-        int requiredLeft = (int)BLOCK_SIZE; // not this: anchor.x;
-        int requiredBottom = ksize.height - 1 - anchor.y;
-        int requiredRight = (int)BLOCK_SIZE; // not this: ksize.width - 1 - anchor.x;
+        kernelMat.convertTo(kernalDataUMat, CV_32FC1);
         int h = isIsolatedBorder ? sz.height : wholeSize.height;
         int w = isIsolatedBorder ? sz.width : wholeSize.width;
-        bool extra_extrapolation = h < requiredTop || h < requiredBottom || w < requiredLeft || w < requiredRight;
 
         if ((w < ksize.width) || (h < ksize.height))
             return false;
 
+        // Figure out what vector size to use for loading the kernel.
+        int kernLoadVecSize = min(4, ksize.width);
+
+        // Figure out what vector size to use for loading the pixels.
+        int pxLoadNumPixels = ((cn != 1) || sz.width % 4) ? 1 : 4;
+        int pxLoadVecSize = cn * pxLoadNumPixels;
+
+        // Figure out how many pixels per work item to compute in X and Y
+        // directions.  Too many and we run out of registers.
+        int pxPerWorkItemX = 1;
+        int pxPerWorkItemY = 1;
+        if (cn <= 2 && ksize.width <= 4 && ksize.height <= 4)
+        {
+            pxPerWorkItemX = sz.width % 8 ? sz.width % 4 ? sz.width % 2 ? 1 : 2 : 4 : 8;
+            pxPerWorkItemY = sz.width % 2 ? 1 : 2;
+        }
+        else if (cn < 4 || (ksize.width <= 4 && ksize.height <= 4))
+        {
+            pxPerWorkItemX = sz.width % 2 ? 1 : 2;
+            pxPerWorkItemY = sz.width % 2 ? 1 : 2;
+        }
+        globalsize[0] = sz.height / pxPerWorkItemX;
+        globalsize[1] = sz.height / pxPerWorkItemY;
+
+        // Need some padding in the private array for pixels
+        int privDataWidth = ROUNDUP(pxPerWorkItemX + ksize.width - 1, pxLoadNumPixels);
+
+        // Make the global size a nice round number so the runtime can pick
+        // from reasonable choices for the workgroup size
+        const int wgRound = 256;
+        globalsize[0] = ROUNDUP(sz.width, wgRound);
+
         char build_options[1024];
-        sprintf(build_options, "-D LOCAL_SIZE=%d -D BLOCK_SIZE_Y=%d -D DATA_DEPTH=%d -D DATA_CHAN=%d -D USE_DOUBLE=%d "
+        sprintf(build_options, "-D DATA_DEPTH=%d -D DATA_CHAN=%d -D USE_DOUBLE=%d "
                 "-D ANCHOR_X=%d -D ANCHOR_Y=%d -D KERNEL_SIZE_X=%d -D KERNEL_SIZE_Y=%d -D KERNEL_SIZE_Y2_ALIGNED=%d "
-                "-D %s -D %s -D %s",
-                (int)BLOCK_SIZE, (int)BLOCK_SIZE_Y,
+                "-D KERN_LOAD_VEC_SIZE=%d -D PX_LOAD_VEC_SIZE=%d -D PX_LOAD_NUM_PX=%d "
+                "-D PX_PER_WI_X=%d -D PX_PER_WI_Y=%d -D PRIV_DATA_WIDTH=%d -D %s -D %s "
+                "-D PX_LOAD_X_ITERATIONS=%d -D PX_LOAD_Y_ITERATIONS=%d",
                 sdepth, cn, useDouble ? 1 : 0,
                 anchor.x, anchor.y, ksize.width, ksize.height, kernel_size_y2_aligned,
-                btype,
-                extra_extrapolation ? "EXTRA_EXTRAPOLATION" : "NO_EXTRA_EXTRAPOLATION",
-                isIsolatedBorder ? "BORDER_ISOLATED" : "NO_BORDER_ISOLATED");
-
-        localsize[0] = BLOCK_SIZE;
-        globalsize[0] = DIVUP(sz.width, BLOCK_SIZE - (ksize.width - 1)) * BLOCK_SIZE;
-        globalsize[1] = DIVUP(sz.height, BLOCK_SIZE_Y);
-
+                kernLoadVecSize, pxLoadVecSize, pxLoadNumPixels,
+                pxPerWorkItemX, pxPerWorkItemY, privDataWidth, btype,
+                isIsolatedBorder ? "BORDER_ISOLATED" : "NO_BORDER_ISOLATED",
+                privDataWidth / pxLoadNumPixels, pxPerWorkItemY + ksize.height - 1);
         cv::String errmsg;
-        if (!kernel.create("filter2D", cv::ocl::imgproc::filter2D_oclsrc, build_options))
+        if (!kernel.create("filter2DSmall", cv::ocl::imgproc::filter2DSmall_oclsrc, build_options, &errmsg))
             return false;
-        size_t kernelWorkGroupSize = kernel.workGroupSize();
-        if (localsize[0] <= kernelWorkGroupSize)
-            break;
-        if (BLOCK_SIZE < kernelWorkGroupSize)
-            return false;
-        tryWorkItems = kernelWorkGroupSize;
+    }
+    else
+    {
+        if (useDouble)
+        {
+            kernalDataUMat = UMat(kernelMatDataDouble, true);
+        }
+        else
+        {
+            kernalDataUMat = UMat(kernelMatDataFloat, true);
+        }
+        size_t localsize_general[2] = {0, 1};
+        localsize = localsize_general;
+        size_t maxWorkItemSizes[32]; device.maxWorkItemSizes(maxWorkItemSizes);
+        size_t tryWorkItems = maxWorkItemSizes[0];
+        for (;;)
+        {
+            size_t BLOCK_SIZE = tryWorkItems;
+            while (BLOCK_SIZE > 32 && BLOCK_SIZE >= (size_t)ksize.width * 2 && BLOCK_SIZE > (size_t)sz.width * 2)
+                BLOCK_SIZE /= 2;
+#if 1 // TODO Mode with several blocks requires a much more VGPRs, so this optimization is not actual for the current devices
+            size_t BLOCK_SIZE_Y = 1;
+#else
+            size_t BLOCK_SIZE_Y = 8; // TODO Check heuristic value on devices
+            while (BLOCK_SIZE_Y < BLOCK_SIZE / 8 && BLOCK_SIZE_Y * src.clCxt->getDeviceInfo().maxComputeUnits * 32 < (size_t)src.rows)
+                BLOCK_SIZE_Y *= 2;
+#endif
+
+            if ((size_t)ksize.width > BLOCK_SIZE)
+                return false;
+
+            int requiredTop = anchor.y;
+            int requiredLeft = (int)BLOCK_SIZE; // not this: anchor.x;
+            int requiredBottom = ksize.height - 1 - anchor.y;
+            int requiredRight = (int)BLOCK_SIZE; // not this: ksize.width - 1 - anchor.x;
+            int h = isIsolatedBorder ? sz.height : wholeSize.height;
+            int w = isIsolatedBorder ? sz.width : wholeSize.width;
+            bool extra_extrapolation = h < requiredTop || h < requiredBottom || w < requiredLeft || w < requiredRight;
+
+            if ((w < ksize.width) || (h < ksize.height))
+                return false;
+
+            char build_options[1024];
+            sprintf(build_options, "-D LOCAL_SIZE=%d -D BLOCK_SIZE_Y=%d -D DATA_DEPTH=%d -D DATA_CHAN=%d -D USE_DOUBLE=%d "
+                    "-D ANCHOR_X=%d -D ANCHOR_Y=%d -D KERNEL_SIZE_X=%d -D KERNEL_SIZE_Y=%d -D KERNEL_SIZE_Y2_ALIGNED=%d "
+                    "-D %s -D %s -D %s",
+                    (int)BLOCK_SIZE, (int)BLOCK_SIZE_Y,
+                    sdepth, cn, useDouble ? 1 : 0,
+                    anchor.x, anchor.y, ksize.width, ksize.height, kernel_size_y2_aligned,
+                    btype,
+                    extra_extrapolation ? "EXTRA_EXTRAPOLATION" : "NO_EXTRA_EXTRAPOLATION",
+                    isIsolatedBorder ? "BORDER_ISOLATED" : "NO_BORDER_ISOLATED");
+
+            localsize[0] = BLOCK_SIZE;
+            globalsize[0] = DIVUP(sz.width, BLOCK_SIZE - (ksize.width - 1)) * BLOCK_SIZE;
+            globalsize[1] = DIVUP(sz.height, BLOCK_SIZE_Y);
+
+            cv::String errmsg;
+            if (!kernel.create("filter2D", cv::ocl::imgproc::filter2D_oclsrc, build_options))
+                return false;
+            size_t kernelWorkGroupSize = kernel.workGroupSize();
+            if (localsize[0] <= kernelWorkGroupSize)
+                break;
+            if (BLOCK_SIZE < kernelWorkGroupSize)
+                return false;
+            tryWorkItems = kernelWorkGroupSize;
+        }
     }
 
     _dst.create(sz, CV_MAKETYPE(ddepth, cn));
@@ -3304,16 +3379,7 @@ static bool ocl_filter2D( InputArray _src, OutputArray _dst, int ddepth,
         else
             idxArg = kernel.set(idxArg, (void *)&borderValue[0], sizeof(float) * cnocl);
     }
-    if (useDouble)
-    {
-        UMat kernalDataUMat(kernelMatDataDouble, true);
-        idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadOnly(kernalDataUMat));
-    }
-    else
-    {
-        UMat kernalDataUMat(kernelMatDataFloat, true);
-        idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadOnly(kernalDataUMat));
-    }
+    idxArg = kernel.set(idxArg, ocl::KernelArg::PtrReadOnly(kernalDataUMat));
     return kernel.run(2, globalsize, localsize, true);
 }
 
